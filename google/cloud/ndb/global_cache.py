@@ -18,6 +18,7 @@ import abc
 import base64
 import hashlib
 import os
+import logging
 import pymemcache.exceptions
 import redis.exceptions
 import threading
@@ -27,9 +28,13 @@ import warnings
 import pymemcache
 import redis as redis_module
 
+from google.cloud.ndb import utils
+
 # Python 2.7 doesn't have ConnectionError. In Python 3, ConnectionError is subclass of
 # OSError, which Python 2.7 does have.
 ConnectionError = getattr(__builtins__, "ConnectionError", OSError)
+
+log = logging.getLogger(__name__)
 
 
 class GlobalCache(object):
@@ -216,8 +221,11 @@ class _InProcessGlobalCache(GlobalCache):
         """Implements :meth:`GlobalCache.get`."""
         now = time.time()
         results = [self.cache.get(key) for key in keys]
+        utils.logging_debug(log, 'get: {}',
+                            ' '.join(f'{key} {"hit" if result else "miss"}'
+                                     for key, result in zip(keys, results)))
         entity_pbs = []
-        for result in results:
+        for key, result in zip(keys, results):
             if result is not None:
                 entity_pb, expires = result
                 if expires and expires < now:
@@ -234,6 +242,7 @@ class _InProcessGlobalCache(GlobalCache):
         if expires:
             expires = time.time() + expires
 
+        utils.logging_debug(log, 'set: {}', ' '.join(items.keys()))
         for key, value in items.items():
             self.cache[key] = (value, expires)  # Supposedly threadsafe
 
@@ -247,20 +256,25 @@ class _InProcessGlobalCache(GlobalCache):
             set_value = (value, expires)
             results[key] = self.cache.setdefault(key, set_value) is set_value
 
+        utils.logging_debug(log, 'set_if_not_exists: {}', results)
+
         return results
 
     def delete(self, keys):
         """Implements :meth:`GlobalCache.delete`."""
+        utils.logging_debug(log, 'delete: {}', keys)
         for key in keys:
             self.cache.pop(key, None)  # Threadsafe?
 
     def watch(self, items):
         """Implements :meth:`GlobalCache.watch`."""
+        utils.logging_debug(log, 'watch: {}', items)
         for key, value in items.items():
             self._watch_keys[key] = value
 
     def unwatch(self, keys):
         """Implements :meth:`GlobalCache.unwatch`."""
+        utils.logging_debug(log, 'unwatch: {}', keys)
         for key in keys:
             self._watch_keys.pop(key, None)
 
@@ -278,10 +292,13 @@ class _InProcessGlobalCache(GlobalCache):
                 self.cache[key] = (new_value, expires)
                 results[key] = True
 
+        utils.logging_debug(log, 'compare_and_swap: {}', results)
+
         return results
 
     def clear(self):
         """Implements :meth:`GlobalCache.clear`."""
+        utils.logging_debug(log, 'clear')
         self.cache.clear()
 
 
@@ -605,9 +622,13 @@ class MemcacheCache(GlobalCache):
 
     def get(self, keys):
         """Implements :meth:`GlobalCache.get`."""
-        keys = [self._key(key) for key in keys]
-        result = self.client.get_many(keys)
-        return [result.get(key) for key in keys]
+        _keys = [self._key(key) for key in keys]
+        result = self.client.get_many(_keys)
+        ret = [result.get(key) for key in _keys]
+        utils.logging_debug(log, 'get: {}',
+                            ' '.join(f'{key} {"hit" if val else "miss"}'
+                                     for key, val in zip(keys, ret)))
+        return ret
 
     def set(self, items, expires=None):
         """Implements :meth:`GlobalCache.set`."""
@@ -621,8 +642,10 @@ class MemcacheCache(GlobalCache):
             items[key] = value
 
         unset_keys = self.client.set_many(items, expire=expires, noreply=False)
+        utils.logging_debug(log, 'set: {}', ' '.join(orig_keys.values()))
         if unset_keys:
             unset_keys = [orig_keys[key] for key in unset_keys]
+            utils.logging_debug(log, '  unset keys: {}', ' '.join(unset_keys))
             warnings.warn(
                 "Keys failed to set in memcache: {}".format(unset_keys),
                 RuntimeWarning,
@@ -638,15 +661,18 @@ class MemcacheCache(GlobalCache):
                 self._key(key), value, expire=expires, noreply=False
             )
 
+        utils.logging_debug(log, 'set_if_not_exists: {}', results)
         return results
 
     def delete(self, keys):
         """Implements :meth:`GlobalCache.delete`."""
+        utils.logging_debug(log, 'delete: {}', keys)
         keys = [self._key(key) for key in keys]
         self.client.delete_many(keys)
 
     def watch(self, items):
         """Implements :meth:`GlobalCache.watch`."""
+        utils.logging_debug(log, 'watch: {}', items)
         caskeys = self.caskeys
         keys = []
         prev_values = {}
@@ -661,6 +687,7 @@ class MemcacheCache(GlobalCache):
 
     def unwatch(self, keys):
         """Implements :meth:`GlobalCache.unwatch`."""
+        utils.logging_debug(log, 'unwatch: {}', keys)
         keys = [self._key(key) for key in keys]
         caskeys = self.caskeys
         for key in keys:
@@ -681,8 +708,10 @@ class MemcacheCache(GlobalCache):
                 self.client.cas(key, value, caskey, expire=expires, noreply=False)
             )
 
+        utils.logging_debug(log, 'compare_and_swap: {}', results)
         return results
 
     def clear(self):
         """Implements :meth:`GlobalCache.clear`."""
+        utils.logging_debug(log, 'clear')
         self.client.flush_all()
